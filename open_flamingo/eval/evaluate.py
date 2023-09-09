@@ -54,7 +54,8 @@ parser.add_argument(
     "--query_set_size", type=int, default=2048, help="Size of demonstration query set"
 )
 
-parser.add_argument("--batch_size", type=int, default=8)
+#parser.add_argument("--batch_size", type=int, default=8)
+parser.add_argument("--batch_size_map", type=str, default="0:180,4:160,8:90,16:52,32:28")
 
 parser.add_argument(
     "--no_caching_for_classification",
@@ -121,12 +122,21 @@ parser.add_argument(
     action="store_true",
     help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc).",
 )
+# dynamic adjusting batchsize mapping
+def parse_batch_size_map(batch_size_map_str):
+    mapping = {}
+    pairs = batch_size_map_str.split(',')
+    for pair in pairs:
+        shot, batch_size = pair.split(':')
+        mapping[int(shot)] = int(batch_size)
+    return mapping
 
 
 def main():
     args, leftovers = parser.parse_known_args()
     module = importlib.import_module(f"open_flamingo.eval.models.{args.model}")
-
+    args.batch_size_map = parse_batch_size_map(args.batch_size_map)
+    
     model_args = {
         leftovers[i].lstrip("-"): leftovers[i + 1] for i in range(0, len(leftovers), 2)
     }
@@ -158,12 +168,15 @@ def main():
             cached_features = None
 
         for shot in args.shots:
+            batch_size = args.batch_size_map.get(shot, args.batch_size_map[0])  # 使用默认值，如果没有为该 shot 定义 batch_size的话
+            print(batch_size)
             scores = []
             for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
                 imagenet_score = evaluate_classification(
                     args,
                     eval_model=eval_model,
                     num_shots=shot,
+                    batch_size=batch_size,
                     seed=seed,
                     no_kv_caching=args.no_caching_for_classification,
                     dataset_name="imagenet",
@@ -196,6 +209,7 @@ def main():
 def evaluate_classification(
     args: argparse.Namespace,
     eval_model,
+    batch_size: int,
     seed: int = 42,
     num_shots: int = 8,
     dataset_name: str = "imagenet",
@@ -239,14 +253,14 @@ def evaluate_classification(
     test_dataloader = utils.prepare_eval_samples(
         test_dataset,
         args.num_samples if args.num_samples > 0 else len(test_dataset),
-        args.batch_size,
+        batch_size,
     )
 
     if args.rices:
         rices_dataset = RICES(
             train_dataset,
             eval_model.device,
-            args.batch_size,
+            batch_size,
             cached_features=cached_features,
             vision_encoder_path=args.rices_vision_encoder_path,
             vision_encoder_pretrained=args.rices_vision_encoder_pretrained,
@@ -296,7 +310,7 @@ def evaluate_classification(
                     context_text
                     + prompt_fn({"class_name": None})
                 )
-
+                # <image>Output:Dog<|endofchunk|><image>Output:Dog<|endofchunk|><image>Output:class_name
             # get predicted class names
             logprobs.append(
                 eval_model.get_rank_classifications(
