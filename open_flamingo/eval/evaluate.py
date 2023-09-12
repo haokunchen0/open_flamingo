@@ -10,12 +10,13 @@ import torch
 import utils
 import math
 
-from eval_datasets import ImageNetDataset
+from eval_datasets import ImageNetDataset,CUB200Dataset,StanfordCarDataset, StanfordDogDataset
 
-from rices import RICES
+
+from rices import RICES,RICES_Text
 from tqdm import tqdm
 
-from classification_utils import IMAGENET_CLASSNAMES
+from classification_utils import IMAGENET_CLASSNAMES, CUB_CLASSNAMES, STANFORD_CAR_CLASSNAMES, STANFORD_DOG_CLASSNAMES
 from open_flamingo.train.distributed import init_distributed_device, world_info_from_env
 
 parser = argparse.ArgumentParser()
@@ -73,6 +74,12 @@ parser.add_argument(
     help="Whether to use RICES for evaluation. If False, uses random demonstrations.",
 )
 parser.add_argument(
+    "--rices_text",
+    action="store_true",
+    help="Whether to use RICES_text for evaluation. If False, uses random demonstrations.",
+)
+
+parser.add_argument(
     "--rices_vision_encoder_path",
     default="ViT-L-14",
     type=str,
@@ -89,16 +96,9 @@ parser.add_argument(
     default=None,
     help="Directory where rices features for all choices of in-context examples are stored as a pkl file with the dataset name. If None, features are re-computed by script.",
 )
-# Per-dataset evaluation flags
-parser.add_argument(
-    "--eval_imagenet",
-    action="store_true",
-    default=False,
-    help="Whether to evaluate on ImageNet.",
-)
 # Dataset arguments
-## Imagenet dataset
-parser.add_argument("--imagenet_root", type=str, default="/tmp")
+## load dataset
+parser.add_argument("--dataset_root", type=str, default="/tmp")
 
 # Distributed evaluation
 parser.add_argument(
@@ -122,6 +122,14 @@ parser.add_argument(
     action="store_true",
     help="Don't set device index from local rank (when CUDA_VISIBLE_DEVICES restricted to one per proc).",
 )
+parser.add_argument(
+    "--pkl_name",
+    type=str,
+    required=True,
+    help="Name of the label.pkl to choose.",
+)
+# Choose dataset to evaluate
+parser.add_argument("--dataset_name", type=str, default="imagenet")
 # dynamic adjusting batchsize mapping
 def parse_batch_size_map(batch_size_map_str):
     mapping = {}
@@ -155,51 +163,54 @@ def main():
         raise ValueError("Number of trial seeds must be == number of trials.")
 
     results = defaultdict(list)
+    
+    print(f"Evaluating on {args.dataset_name} Dataset...")
 
-    if args.eval_imagenet:
-        print("Evaluating on ImageNet...")
+    # load cached demonstration features for RICES
+    if args.cached_demonstration_features is not None and args.rices:
+        cached_features = torch.load(
+            f"{args.cached_demonstration_features}/{args.pkl_name}", map_location="cpu"
+        )
+    elif args.cached_demonstration_features is not None and args.rices_text:
+        cached_features = torch.load(
+            f"{args.cached_demonstration_features}/{args.pkl_name}", map_location="cpu"
+        )
+    else:
+        cached_features = None
 
-        # load cached demonstration features for RICES
-        if args.cached_demonstration_features is not None:
-            cached_features = torch.load(
-                f"{args.cached_demonstration_features}/imagenet.pkl", map_location="cpu"
+    for shot in args.shots:
+        batch_size = args.batch_size_map.get(shot, args.batch_size_map[0])  # 使用默认值，如果没有为该 shot 定义 batch_size的话
+        print(batch_size)
+        scores = []
+        for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
+            dataset_score = evaluate_classification(
+                args,
+                eval_model=eval_model,
+                num_shots=shot,
+                batch_size=batch_size,
+                seed=seed,
+                no_kv_caching=args.no_caching_for_classification,
+                dataset_name=args.dataset_name,
+                cached_features=cached_features,
+                use_prompt_ensembling=args.classification_prompt_ensembling,
             )
-        else:
-            cached_features = None
-
-        for shot in args.shots:
-            batch_size = args.batch_size_map.get(shot, args.batch_size_map[0])  # 使用默认值，如果没有为该 shot 定义 batch_size的话
-            print(batch_size)
-            scores = []
-            for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
-                imagenet_score = evaluate_classification(
-                    args,
-                    eval_model=eval_model,
-                    num_shots=shot,
-                    batch_size=batch_size,
-                    seed=seed,
-                    no_kv_caching=args.no_caching_for_classification,
-                    dataset_name="imagenet",
-                    cached_features=cached_features,
-                    use_prompt_ensembling=args.classification_prompt_ensembling,
-                )
-                if args.rank == 0:
-                    print(
-                        f"Shots {shot} Trial {trial} "
-                        f"ImageNet score: {imagenet_score}"
-                    )
-                    scores.append(imagenet_score)
-
             if args.rank == 0:
-                print(f"Shots {shot} Mean ImageNet score: {np.nanmean(scores)}")
-                results["imagenet"].append(
-                    {
-                        "shots": shot,
-                        "trials": scores,
-                        "mean": np.nanmean(scores),
-                        "stddev": np.nanstd(scores),
-                    }
+                print(
+                    f"Shots {shot} Trial {trial} "
+                    f"{args.dataset_name} score: {dataset_score}"
                 )
+                scores.append(dataset_score)
+
+        if args.rank == 0:
+            print(f"Shots {shot} Mean {args.dataset_name} score: {np.nanmean(scores)}")
+            results[f"{args.dataset_name}"].append(
+                {
+                    "shots": shot,
+                    "trials": scores,
+                    "mean": np.nanmean(scores),
+                    "stddev": np.nanstd(scores),
+                }
+            )
                 
     if args.rank == 0 and args.results_file is not None:
         with open(args.results_file, "w") as f:
@@ -236,15 +247,54 @@ def evaluate_classification(
             "evaluate_classification is currently only supported for OpenFlamingo"
         )
 
-    if dataset_name == "imagenet":
-        train_dataset = ImageNetDataset(os.path.join(args.imagenet_root, "train"))
-        test_dataset = ImageNetDataset(os.path.join(args.imagenet_root, "val"))
+    if dataset_name == "cub200":
+        train_dataset = CUB200Dataset(
+            root=args.dataset_root
+        )
+        test_dataset = CUB200Dataset(
+            root=args.dataset_root,
+            train=False
+        )
+        prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
+        all_class_names = CUB_CLASSNAMES
+        k = 5
+    elif dataset_name == "imagenet":
+        train_dataset = ImageNetDataset(
+            root=(os.path.join(args.dataset_root, "train"))
+        )
+        test_dataset = ImageNetDataset(
+            root=(os.path.join(args.dataset_root, "test"))
+        )
         prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
         all_class_names = IMAGENET_CLASSNAMES
         k = 5
+        # /data/hyh/car_data/car_data/
+    elif dataset_name == "stanford_car":
+        train_dataset = StanfordCarDataset(
+            root=(os.path.join(args.imagenet_root, "train"))
+        )
+        test_dataset = StanfordCarDataset(
+            root=(os.path.join(args.imagenet_root, "test"))
+        )
+        prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
+        all_class_names = STANFORD_CAR_CLASSNAMES
+        k = 5
+            
+    elif dataset_name == "stanford_dog":
+        train_dataset = StanfordDogDataset(
+            root=args.imagenet_root
+        )
+        test_dataset = StanfordDogDataset(
+            root=args.imagenet_root,
+            train=False
+        )
+        prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
+        all_class_names = STANFORD_DOG_CLASSNAMES
+        k = 5
     else:
-        raise ValueError(f"Unsupported dataset {dataset_name}")
+        raise ValueError(f"Unsupported dataset {args.dataset_name}")
 
+    labels = all_class_names
     class_id_to_name = dict(zip(range(len(all_class_names)), all_class_names))
 
     effective_num_shots = utils.compute_effective_num_shots(num_shots, args.model)
@@ -255,10 +305,21 @@ def evaluate_classification(
         args.num_samples if args.num_samples > 0 else len(test_dataset),
         batch_size,
     )
-
     if args.rices:
+        print("rices has been activated...")
         rices_dataset = RICES(
             train_dataset,
+            eval_model.device,
+            batch_size,
+            cached_features=cached_features,
+            vision_encoder_path=args.rices_vision_encoder_path,
+            vision_encoder_pretrained=args.rices_vision_encoder_pretrained,
+        )
+    elif args.rices_text:
+        print("rices_text has been activated...")
+        rices_text_labels = RICES_Text(
+            train_dataset,
+            labels,
             eval_model.device,
             batch_size,
             cached_features=cached_features,
@@ -278,6 +339,10 @@ def evaluate_classification(
     ):
         if args.rices:
             batch_demo_samples = rices_dataset.find(batch["image"], effective_num_shots)
+        elif args.rices_text:
+            batch_demo_labels = rices_text_labels.find(batch["image"], 1)
+            #Currently rices_text's similiar label is set to be 1, wait and see...
+            batch_demo_samples = rices_text_labels.get_images_from_labels(batch_demo_labels, effective_num_shots)
         else:
             batch_demo_samples = utils.sample_batch_demos_from_query_set(
                 query_set, effective_num_shots, len(batch["image"])
@@ -299,9 +364,7 @@ def evaluate_classification(
                 else:
                     context_images = []
                 batch_images.append(context_images + [batch["image"][i]])
-
                 context_text = "".join([prompt_fn(x) for x in batch_demo_samples[i]])
-
                 # Keep the text but remove the image tags for the zero-shot case
                 if num_shots == 0:
                     context_text = context_text.replace("<image>", "")
@@ -310,7 +373,7 @@ def evaluate_classification(
                     context_text
                     + prompt_fn({"class_name": None})
                 )
-                # <image>Output:Dog<|endofchunk|><image>Output:Dog<|endofchunk|><image>Output:class_name
+                # batch_text: <image>Output:Dog<|endofchunk|><image>Output:Dog<|endofchunk|><image>Output:class_name
             # get predicted class names
             logprobs.append(
                 eval_model.get_rank_classifications(
