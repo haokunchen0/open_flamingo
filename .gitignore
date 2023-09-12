@@ -1,3 +1,6 @@
+# test files
+test*
+
 *.pt
 *.json
 
@@ -143,4 +146,4 @@ wandb
 # Cache
 cache/
 
-__*.sh
+*.sh
