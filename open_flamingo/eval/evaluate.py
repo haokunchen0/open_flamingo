@@ -10,7 +10,7 @@ import torch
 import utils
 import math
 
-from eval_datasets import ImageNetDataset,CUB200Dataset,StanfordCarDataset, StanfordDogDataset
+from eval_datasets import ImageNetDataset, CUB200Dataset, StanfordCarDataset, StanfordDogDataset
 
 
 from rices import RICES,RICES_Text
@@ -56,7 +56,7 @@ parser.add_argument(
 )
 
 #parser.add_argument("--batch_size", type=int, default=8)
-parser.add_argument("--batch_size_map", type=str, default="0:180,4:160,8:90,16:52,32:28")
+parser.add_argument("--batch_size_map", type=str, default="0:180,1:128,2:96,4:48,8:16")
 
 parser.add_argument(
     "--no_caching_for_classification",
@@ -169,7 +169,7 @@ def main():
     # load cached demonstration features for RICES
     if args.cached_demonstration_features is not None and args.rices:
         cached_features = torch.load(
-            f"{args.cached_demonstration_features}/{args.pkl_name}", map_location="cpu"
+            f"{args.cached_demonstration_features}/{args.dataset_name}.pkl", map_location="cpu"
         )
     elif args.cached_demonstration_features is not None and args.rices_text:
         cached_features = torch.load(
@@ -213,7 +213,7 @@ def main():
             )
                 
     if args.rank == 0 and args.results_file is not None:
-        with open(args.results_file, "w") as f:
+        with open(args.results_file, "a") as f:
             json.dump(results, f)
 
 
@@ -271,10 +271,10 @@ def evaluate_classification(
         # /data/hyh/car_data/car_data/
     elif dataset_name == "stanford_car":
         train_dataset = StanfordCarDataset(
-            root=(os.path.join(args.imagenet_root, "train"))
+            root=(os.path.join(args.dataset_root, "train"))
         )
         test_dataset = StanfordCarDataset(
-            root=(os.path.join(args.imagenet_root, "test"))
+            root=(os.path.join(args.dataset_root, "test"))
         )
         prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
         all_class_names = STANFORD_CAR_CLASSNAMES
@@ -282,10 +282,10 @@ def evaluate_classification(
             
     elif dataset_name == "stanford_dog":
         train_dataset = StanfordDogDataset(
-            root=args.imagenet_root
+            root=args.dataset_root
         )
         test_dataset = StanfordDogDataset(
-            root=args.imagenet_root,
+            root=args.dataset_root,
             train=False
         )
         prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
@@ -377,11 +377,11 @@ def evaluate_classification(
             # get predicted class names
             logprobs.append(
                 eval_model.get_rank_classifications(
+                    False,
                     batch_text,
                     batch_images,
                     all_class_names,
-                    use_cache=(not no_kv_caching),
-                    normalize_length=True,
+                    use_cache=(not no_kv_caching)
                 )
             )
 
