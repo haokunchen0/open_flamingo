@@ -1,6 +1,6 @@
 from torchvision.datasets import ImageFolder
 from torch.utils.data import Dataset
-from open_flamingo.eval.classification_utils import IMAGENET_CLASSNAMES
+from classification_utils import IMAGENET_CLASSNAMES, IMAGENET_CLASSNAMES_SUB
 from classification_utils import STANFORD_CAR_ID_TO_LABEL, CUB_CLASSNAMES, STANFORD_DOG_CLASSNAMES
 
 import os
@@ -25,6 +25,41 @@ class ImageNetDataset(ImageFolder):
             "class_id": target,  # numeric ID of the ImageNet class
             "class_name": target_label,  # human-readable name of ImageNet class
         }
+        
+class ImageNetSubsetDataset(ImageFolder):
+    def __init__(self, root, **kwargs):
+        super().__init__(root=root, **kwargs)
+        
+        # 将IMAGENET_CLASSNAMES映射到self.classes
+        self.full_class_to_foldername = dict(zip(IMAGENET_CLASSNAMES, self.classes))
+        
+        # 为子集创建一个新的映射
+        self.subset_class_to_foldername = {cls: self.full_class_to_foldername[cls] for cls in ['fly', 'bee', 'ant']}
+        subset_folder_names = list(self.subset_class_to_foldername.values())
+        
+        # 只保留子集类别的数据
+        self.samples = [s for s in self.samples if self.classes[s[1]] in subset_folder_names]
+        self.imgs = self.samples
+        
+        # 建立新的类名到索引的映射
+        self.class_name_to_id = {name: idx for idx, name in enumerate(['fly', 'bee', 'ant'])}
+        
+    def __getitem__(self, idx):
+        sample, old_target = super().__getitem__(idx)
+        
+        # 获取正确的子集类名和对应的索引
+        class_name = self.classes[old_target]
+        for name, id in self.class_name_to_id.items():
+            if self.full_class_to_foldername[name] == class_name:
+                target = id
+                break
+        
+        return {
+            "id": idx,
+            "image": sample,
+            "class_id": target,  # numeric ID of the ImageNet subset class
+            "class_name": name,  # human-readable name of ImageNet class
+        }
 
 class CUB200Dataset(Dataset):
     """Class to represent the CUB dataset."""
@@ -35,6 +70,7 @@ class CUB200Dataset(Dataset):
         self.train = train
         self.image_paths = []
         self.labels = []
+        self.class_id_to_name = dict(zip(range(len(CUB_CLASSNAMES)), CUB_CLASSNAMES))
 
         image_names = self._get_image_names()
 
@@ -111,25 +147,30 @@ class StanfordDogDataset(Dataset):
         self.transform = transform
         self.train = train
         self.image_paths = []
+        self.labels_ = []
         self.labels = []
         self.split_file = "train_list.mat" if self.train else "test_list.mat"
+        self.class_id_to_name = dict(zip(range(len(STANFORD_DOG_CLASSNAMES)), STANFORD_DOG_CLASSNAMES))
 
+        self.class_name2id = dict(
+            zip(STANFORD_DOG_CLASSNAMES, range(len(STANFORD_DOG_CLASSNAMES)))
+        )
         # Load split_file
         file_list = scipy.io.loadmat(os.path.join(self.root, self.split_file))['file_list']
         for item in file_list:
             file_path = item[0][0]
             self.image_paths.append(os.path.join(root, "images", file_path))
-            self.labels.append(file_path.split("/")[0][10:])
+            class_name = file_path.split("/")[0][10:]
+            self.labels_.append(class_name)
+            self.labels.append(self.class_name2id[class_name])
+            
 
-        self.class_name2id = dict(
-            zip(STANFORD_DOG_CLASSNAMES, range(len(STANFORD_DOG_CLASSNAMES)))
-        )
 
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        image_path, target_label = self.image_paths[idx], self.labels[idx]
+        image_path, target_label = self.image_paths[idx], self.labels_[idx]
         sample = Image.open(image_path).convert('RGB')
 
         if self.transform is not None:
@@ -142,3 +183,4 @@ class StanfordDogDataset(Dataset):
             "class_id": class_id,  # numeric ID of the ImageNet class
             "class_name": target_label,  # human-readable name of ImageNet class
         }
+        
