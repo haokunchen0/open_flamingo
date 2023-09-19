@@ -35,7 +35,7 @@ class RICES:
 
     def _precompute_features(self):
         features = []
-
+        print(len(self.dataset))
         # Switch to evaluation mode
         self.model.eval()
 
@@ -58,6 +58,7 @@ class RICES:
                 image_features = self.model.encode_image(inputs)
                 image_features /= image_features.norm(dim=-1, keepdim=True)
                 features.append(image_features.detach())
+
 
         features = torch.cat(features)
         return features
@@ -170,11 +171,26 @@ class RICES_Text:
         """
         Get 'shot' number of images for each label in the batch from the training dataset.
         """
+        # Access dataset attributes based on dataset type
+        if hasattr(self.dataset, 'image_paths') and hasattr(self.dataset, 'labels'):
+            image_data = list(zip(self.dataset.image_paths, self.dataset.labels))
+        elif hasattr(self.dataset, 'imgs'):
+            image_data = self.dataset.imgs
+        else:
+            raise ValueError("Dataset does not have required attributes.")
+
+        print(f"Using dataset: {type(self.dataset).__name__}")
+        if hasattr(self.dataset, 'class_id_to_name'):
+            print("Dataset has class_id_to_name attribute.")
+        else:
+            print("Dataset lacks class_id_to_name attribute.")
+
         results = []
         for label_list in batch_labels:
             label = label_list[0]  # As per your example, there's one label per batch item
             matching_indices = [
-                idx for idx, sample in enumerate(self.dataset.imgs) if self.dataset.class_id_to_name[sample[1]] == label
+                idx for idx, (image, img_label) in enumerate(image_data)
+                if self.dataset.class_id_to_name[img_label] == label
             ]
             random.seed(42)
             selected_indices = random.sample(matching_indices, shot)
