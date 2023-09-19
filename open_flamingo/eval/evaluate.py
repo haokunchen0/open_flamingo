@@ -10,13 +10,12 @@ import torch
 import utils
 import math
 
-from eval_datasets import ImageNetDataset, CUB200Dataset, StanfordCarDataset, StanfordDogDataset
-
+from eval_datasets import ImageNetDataset,CUB200Dataset,StanfordCarDataset, StanfordDogDataset,ImageNetSubsetDataset
 
 from rices import RICES,RICES_Text
 from tqdm import tqdm
 
-from classification_utils import IMAGENET_CLASSNAMES, CUB_CLASSNAMES, STANFORD_CAR_CLASSNAMES, STANFORD_DOG_CLASSNAMES
+from classification_utils import IMAGENET_CLASSNAMES_SUB,IMAGENET_CLASSNAMES, CUB_CLASSNAMES, STANFORD_CAR_CLASSNAMES, STANFORD_DOG_CLASSNAMES
 from open_flamingo.train.distributed import init_distributed_device, world_info_from_env
 
 parser = argparse.ArgumentParser()
@@ -56,7 +55,7 @@ parser.add_argument(
 )
 
 #parser.add_argument("--batch_size", type=int, default=8)
-parser.add_argument("--batch_size_map", type=str, default="0:180,1:128,2:96,4:48,8:16")
+parser.add_argument("--batch_size_map", type=str, default="0:180,4:1,8:32")
 
 parser.add_argument(
     "--no_caching_for_classification",
@@ -96,10 +95,21 @@ parser.add_argument(
     default=None,
     help="Directory where rices features for all choices of in-context examples are stored as a pkl file with the dataset name. If None, features are re-computed by script.",
 )
+parser.add_argument(
+    "--label_cached_demonstration_features",
+    default=None,
+    help="for ML image to label..."
+)
 # Dataset arguments
 ## load dataset
 parser.add_argument("--dataset_root", type=str, default="/tmp")
 
+# Multilabel
+parser.add_argument(
+    "--multilabel",
+    action="store_true",
+    help="Whether to use multi-label for evaluation."
+)
 # Distributed evaluation
 parser.add_argument(
     "--dist-url",
@@ -169,7 +179,7 @@ def main():
     # load cached demonstration features for RICES
     if args.cached_demonstration_features is not None and args.rices:
         cached_features = torch.load(
-            f"{args.cached_demonstration_features}/{args.dataset_name}.pkl", map_location="cpu"
+            f"{args.cached_demonstration_features}/{args.pkl_name}", map_location="cpu"
         )
     elif args.cached_demonstration_features is not None and args.rices_text:
         cached_features = torch.load(
@@ -177,10 +187,15 @@ def main():
         )
     else:
         cached_features = None
-
+    if args.multilabel:
+        label_cached_features = torch.load(
+            f"{args.label_cached_demonstration_features}", map_location="cpu"
+        )
+    else:
+        label_cached_features = None
     for shot in args.shots:
         batch_size = args.batch_size_map.get(shot, args.batch_size_map[0])  # 使用默认值，如果没有为该 shot 定义 batch_size的话
-        print(batch_size)
+        print(f"Now evaluating on {batch_size} samples...")
         scores = []
         for seed, trial in zip(args.trial_seeds, range(args.num_trials)):
             dataset_score = evaluate_classification(
@@ -192,6 +207,7 @@ def main():
                 no_kv_caching=args.no_caching_for_classification,
                 dataset_name=args.dataset_name,
                 cached_features=cached_features,
+                label_cached_features=label_cached_features,
                 use_prompt_ensembling=args.classification_prompt_ensembling,
             )
             if args.rank == 0:
@@ -225,6 +241,7 @@ def evaluate_classification(
     num_shots: int = 8,
     dataset_name: str = "imagenet",
     cached_features=None,
+    label_cached_features=None,
     no_kv_caching=False,
     use_prompt_ensembling: bool = False,
 ):
@@ -246,7 +263,7 @@ def evaluate_classification(
         raise NotImplementedError(
             "evaluate_classification is currently only supported for OpenFlamingo"
         )
-
+    # get_prompt_for_labels_lambda = lambda labels: eval_model.get_imagenet_prompt(label=",".join(labels))
     if dataset_name == "cub200":
         train_dataset = CUB200Dataset(
             root=args.dataset_root
@@ -268,6 +285,16 @@ def evaluate_classification(
         prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
         all_class_names = IMAGENET_CLASSNAMES
         k = 5
+    elif dataset_name == 'imagenet_sub':
+        train_dataset = ImageNetSubsetDataset(
+            root=(os.path.join(args.dataset_root, "train")),
+        )
+        test_dataset = ImageNetSubsetDataset(
+            root=(os.path.join(args.dataset_root, "test"))
+        )
+        prompt_fn = lambda x: eval_model.get_imagenet_prompt(label=x["class_name"])
+        all_class_names = ['fly', 'bee', 'ant']
+        k = 2
         # /data/hyh/car_data/car_data/
     elif dataset_name == "stanford_car":
         train_dataset = StanfordCarDataset(
@@ -329,7 +356,17 @@ def evaluate_classification(
     else:
         # subset of the training set to sample context images from
         query_set = utils.get_query_set(train_dataset, args.query_set_size)
-
+    if args.multilabel:
+        print("multilabel has been activated...")
+        rices_text_forML = RICES_Text(
+                        train_dataset,
+                        labels,
+                        eval_model.device,
+                        batch_size,
+                        cached_features=label_cached_features,
+                        vision_encoder_path=args.rices_vision_encoder_path,
+                        vision_encoder_pretrained=args.rices_vision_encoder_pretrained,
+                    )
     utils.random_seed(seed, args.rank)
     predictions = []
     for batch_idx, batch in tqdm(
@@ -347,7 +384,6 @@ def evaluate_classification(
             batch_demo_samples = utils.sample_batch_demos_from_query_set(
                 query_set, effective_num_shots, len(batch["image"])
             )
-
         # set up prompt ensembling
         num_permutations = (
             min(6, math.factorial(effective_num_shots)) if use_prompt_ensembling else 1
@@ -364,20 +400,39 @@ def evaluate_classification(
                 else:
                     context_images = []
                 batch_images.append(context_images + [batch["image"][i]])
-                context_text = "".join([prompt_fn(x) for x in batch_demo_samples[i]])
-                # Keep the text but remove the image tags for the zero-shot case
-                if num_shots == 0:
-                    context_text = context_text.replace("<image>", "")
+                if not args.multilabel:
+                    context_text = "".join([prompt_fn(x) for x in batch_demo_samples[i]])
+                    if num_shots == 0:
+                        context_text = context_text.replace("<image>", "")
+                        # Keep the text but remove the image tags for the zero-shot case
+                    batch_text.append(
+                        context_text
+                        + prompt_fn({"class_name": None})
+                    )
+                else:
+                    # 获取当前batch中所有图片的标签
+                    shots_labels_for_current_batch = rices_text_forML.find([x['image'] for x in batch_demo_samples[i]], 2)
 
-                batch_text.append(
-                    context_text
-                    + prompt_fn({"class_name": None})
-                )
-                # batch_text: <image>Output:Dog<|endofchunk|><image>Output:Dog<|endofchunk|><image>Output:class_name
+                    # 将每张图片的三个标签连接起来
+                    labels_for_each_image = [",".join(shots_labels_for_current_batch[img_idx]) for img_idx in range(len(batch_demo_samples[i]))]
+
+                    # 使用prompt_fn函数生成每张图片的prompt
+                    prompts_for_each_image = [prompt_fn({"class_name": labels}) for labels in labels_for_each_image]
+
+                    # 将所有图片的prompt连接起来
+                    context_text = "".join(prompts_for_each_image)
+
+                    batch_text.append(
+                        context_text
+                        + prompt_fn({"class_name": None})
+                        )
+
+        
+                # batch_text: <image>Output:Dog,Cat,Lion<|endofchunk|><image>Output:class_name
             # get predicted class names
             logprobs.append(
                 eval_model.get_rank_classifications(
-                    False,
+                    args.multilabel,
                     batch_text,
                     batch_images,
                     all_class_names,
@@ -425,7 +480,6 @@ def evaluate_classification(
         int(pred["gt_label"] == pred["pred_label"]) for pred in all_predictions
     )
     return float(acc1) / len(all_predictions)
-
 
 if __name__ == "__main__":
     main()
